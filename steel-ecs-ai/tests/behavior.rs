@@ -1,12 +1,13 @@
-//! Port of `steel-current/src/tests.rs` (same scenarios, same numbers), plus one extra test for
-//! externally removed entities.
+//! Port of `steel-current/src/tests.rs` (same scenarios, same numbers), plus extras for removed
+//! entities and ids.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use steel_ecs_ai::GameWorld;
-use steel_ecs_ai::entity::{EntityId, FLAG_MOVE, Goal, GoalSelector, MobCtx};
-use steel_ecs_ai::log::Logs;
+use steel_ecs_ai::entity::{
+    Cx, Entity, EntityId, FLAG_MOVE, Goal, GoalSelector, Kind, Mob, pipeline,
+};
 use steel_ecs_ai::util::Vec3;
 
 fn run(world: &mut GameWorld, ticks: usize) {
@@ -111,35 +112,29 @@ fn selector_preempts_less_important_conflicting_goal() {
         fn flags(&self) -> u8 {
             FLAG_MOVE
         }
-        fn can_use(&mut self, _m: &MobCtx) -> bool {
+        fn can_use(&mut self, _e: &Entity, _cx: &Cx) -> bool {
             self.want.load(Ordering::Relaxed)
         }
-        fn start(&mut self, _m: &mut MobCtx) {
+        fn start(&mut self, _e: &mut Entity, _cx: &mut Cx) {
             self.log
                 .lock()
                 .unwrap()
                 .push(format!("start {}", self.name));
         }
-        fn stop(&mut self, _m: &mut MobCtx) {
+        fn stop(&mut self, _e: &mut Entity, _cx: &mut Cx) {
             self.log.lock().unwrap().push(format!("stop {}", self.name));
         }
     }
 
-    // steel-current borrowed a spawned cow as `&dyn Mob`; here the goal's view of a mob is
-    // just a `MobCtx`, so the test builds one from plain locals, no world needed.
-    let (mut position, mut velocity, mut yaw, mut logs) =
-        (Vec3::ZERO, Vec3::ZERO, 0.0_f32, Logs::default());
-    let mut mob = MobCtx {
-        id: EntityId(0),
+    // steel-current borrowed a spawned cow as `&dyn Mob`; a goal's view of a mob is just an
+    // `Entity` with a `Mob` part, so the test builds a bare one, no spawning needed.
+    static PROBE: Kind = Kind {
         name: "probe",
-        tick_count: 0,
-        move_speed: 0.1,
-        position: &mut position,
-        velocity: &mut velocity,
-        yaw: &mut yaw,
-        hunger: None,
-        logs: &mut logs,
+        pipeline: pipeline::ANIMAL,
     };
+    let mut world = GameWorld::new();
+    let mut mob = Entity::new(&PROBE, Vec3::ZERO);
+    mob.mob = Some(Mob::new(0.1));
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let (low_want, high_want) = (
@@ -149,24 +144,24 @@ fn selector_preempts_less_important_conflicting_goal() {
     let mut sel = GoalSelector::default();
     sel.add_goal(
         5,
-        Box::new(Probe {
+        Probe {
             name: "low",
             want: low_want,
             log: log.clone(),
-        }),
+        },
     );
     sel.add_goal(
         1,
-        Box::new(Probe {
+        Probe {
             name: "high",
             want: high_want.clone(),
             log: log.clone(),
-        }),
+        },
     );
-    sel.tick(&mut mob);
+    sel.tick(&mut mob, &mut world.cx());
     high_want.store(true, Ordering::Relaxed);
-    sel.tick(&mut mob);
-    sel.tick(&mut mob);
+    sel.tick(&mut mob, &mut world.cx());
+    sel.tick(&mut mob, &mut world.cx());
     assert_eq!(
         *log.lock().unwrap(),
         ["start low", "stop low", "start high"]
@@ -209,16 +204,11 @@ fn externally_removed_entity_is_skipped_then_dropped() {
 
 #[test]
 fn entity_ids_are_monotonic_and_never_reused() {
-    use steel_ecs_ai::entity::EntityId;
     let mut world = GameWorld::new();
     let block = world.spawn_falling_block(0.0, 0.5, 0.0, 0.5); // lands on tick 1
     run(&mut world, 1);
     assert!(world.is_removed(block));
     let cow = world.spawn_cow(Vec3::ZERO, 50);
-    assert_eq!(
-        *world.ecs().get::<EntityId>(cow).unwrap(),
-        EntityId(1),
-        "id 0 is not recycled"
-    );
+    assert_eq!(world.id(cow), Some(EntityId(1)), "id 0 is not recycled");
     assert_ne!(block, cow, "recycled slot has a new generation");
 }

@@ -1,27 +1,27 @@
-//! Entity trait hierarchy -> component sets.
+//! Entities as plain data plus an ordered list of tick stages. No trait hierarchy.
 //!
 //! ```text
-//! steel-current                      steel-ecs-ai
-//! Entity        (EntityBase)         EntityId, Name, Position, Velocity, TickCount, Removed
-//! LivingEntity  (LivingEntityBase)   Health
-//! Mob           (MobBase)            MoveSpeed, Yaw, GoalSelector
-//! AgeableMob    (AgeableMobBase)     Ageable
-//! Animal        (AnimalBase)         Hunger
+//! steel-current                           steel-ecs-ai
+//! trait Entity       (EntityBase)         Entity.base: Base                 id, position, velocity, ...
+//! trait LivingEntity (LivingEntityBase)   Entity.living: Option<Living>     health
+//! trait Mob          (MobBase)            Entity.mob: Option<Mob>           move speed, yaw, goals
+//! trait AgeableMob   (AgeableMobBase)     Entity.ageable: Option<Ageable>   age
+//! trait Animal       (AnimalBase)         Entity.animal: Option<Animal>     hunger
+//! tick_living_entity + ai_step chains     pipeline::ANIMAL                  one ordered list of stages
+//! one struct + 5 trait impls per mob      one `AnimalSpec` value per mob
 //! ```
 //!
-//! What changed in the mapping:
-//! - a trait level is now "has this component"; `as_living_entity()` & co. become
-//!   `storage.contains(entity)`. Nothing enforces that a mob also has `Position`: that
-//!   invariant moved from the type system to `expect` calls in the systems.
-//! - `tick_living_entity` / `ai_step` chains written by hand in `ChickenEntity`/`CowEntity` are
-//!   gone: each tick step is its own system, the schedule order replaces the call chain, and
-//!   which entities take part is decided by which components they carry.
-//! - a concrete entity type is just a spawn function that inserts a component set.
+//! What a mob *is* is the parts it carries. What a tick *does* is its [`Kind`]'s pipeline: a
+//! `&[Stage]` of plain `fn(&mut Entity, &mut Cx)` run in order. The vanilla step order lives in
+//! [`pipeline`] once instead of being re-chained by hand in every concrete type, and a type
+//! that differs from vanilla in one step swaps that one stage.
+//!
+//! The driver (`GameWorld::tick_game`) is the old `EntityManager::tick_entities`: loop over the
+//! entities in spawn order, tick one completely (all its stages) before the next, so an entity
+//! can change another one and the later one sees it in the same tick.
 
-use std::cell::Ref;
+use std::fmt;
 
-use crate::ecs::{Entity, SparseSet, World};
-use crate::log::Logs;
 use crate::util::Vec3;
 
 pub mod ageable;
@@ -30,128 +30,123 @@ pub mod entities;
 pub mod goal;
 pub mod living;
 pub mod mob;
+pub mod pipeline;
+pub mod store;
 
-pub use ageable::*;
-pub use animal::*;
+pub use ageable::Ageable;
+pub use animal::{Animal, AnimalSpec, spawn_animal};
+pub use entities::falling_block::FallingBlock;
+pub use entities::item::Item;
 pub use goal::*;
-pub use living::*;
-pub use mob::*;
+pub use living::Living;
+pub use mob::Mob;
+pub use store::{Cx, Handle, Store};
 
-/// Steel-style network id: monotonic, never reused. (`Entity::index` is recycled.)
+/// Steel-style network id: monotonic, never reused, assigned when the entity is spawned.
+/// (`Handle` is the world's recycled, generation-checked slot reference.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityId(pub u32);
 
-pub struct Name(pub &'static str);
-
+/// Steel: `EntityBase`. What every entity has.
 #[derive(Clone, Copy, Debug)]
-pub struct Position(pub Vec3);
-
-#[derive(Clone, Copy, Debug)]
-pub struct Velocity(pub Vec3);
-
-pub struct TickCount(pub u32);
-
-/// Marker: skipped by every entity system, despawned at the end of the entity pass.
-pub struct Removed;
-
-pub fn spawn_base(world: &mut World, id: EntityId, name: &'static str, position: Vec3) -> Entity {
-    let entity = world.spawn_empty();
-    world.insert(entity, id);
-    world.insert(entity, Name(name));
-    world.insert(entity, Position(position));
-    world.insert(entity, Velocity(Vec3::ZERO));
-    world.insert(entity, TickCount(0));
-    entity
+pub struct Base {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub tick_count: u32,
+    pub removed: bool,
 }
 
-/// Steel: `Entity::set_removed`. No-op for a handle that is already gone.
-pub fn mark_removed(world: &mut World, entity: Entity) {
-    if world.is_alive(entity) {
-        world.insert(entity, Removed);
-    }
+/// One step of an entity's tick.
+pub type Stage = fn(&mut Entity, &mut Cx);
+
+/// The type of an entity: log name + the stages its tick runs, in order.
+pub struct Kind {
+    pub name: &'static str,
+    pub pipeline: &'static [Stage],
 }
 
-/// The read-only components almost every entity system needs (skip check + log prefix).
-/// A hand-written stand-in for what a query tuple like `(&EntityId, &Name, &TickCount,
-/// Without<Removed>)` gives for free. Holds shared guards, so a system must drop it before
-/// it can `insert` a `Removed` marker.
-pub struct EntityHeader<'w> {
-    removed: Ref<'w, SparseSet<Removed>>,
-    ids: Ref<'w, SparseSet<EntityId>>,
-    names: Ref<'w, SparseSet<Name>>,
-    ticks: Ref<'w, SparseSet<TickCount>>,
+pub struct Entity {
+    pub base: Base,
+    pub kind: &'static Kind,
+    pub living: Option<Living>,
+    pub mob: Option<Mob>,
+    pub ageable: Option<Ageable>,
+    pub animal: Option<Animal>,
+    pub item: Option<Item>,
+    pub falling_block: Option<FallingBlock>,
 }
 
-impl<'w> EntityHeader<'w> {
-    pub fn new(world: &'w World) -> Self {
+impl Entity {
+    /// A bare entity. Add parts with struct-update syntax or by assigning the fields; the id is
+    /// assigned by [`Cx::spawn`].
+    pub fn new(kind: &'static Kind, position: Vec3) -> Self {
         Self {
-            removed: world.read(),
-            ids: world.read(),
-            names: world.read(),
-            ticks: world.read(),
+            base: Base {
+                id: EntityId(0),
+                position,
+                velocity: Vec3::ZERO,
+                tick_count: 0,
+                removed: false,
+            },
+            kind,
+            living: None,
+            mob: None,
+            ageable: None,
+            animal: None,
+            item: None,
+            falling_block: None,
         }
     }
 
-    /// Steel: `!entity.is_removed()`.
-    pub fn is_active(&self, entity: Entity) -> bool {
-        !self.removed.contains(entity)
+    pub fn name(&self) -> &'static str {
+        self.kind.name
     }
 
-    pub fn id(&self, entity: Entity) -> EntityId {
-        *self.ids.get(entity).expect("entity without EntityId")
-    }
-
-    pub fn name(&self, entity: Entity) -> &'static str {
-        self.names.get(entity).expect("entity without Name").0
-    }
-
-    pub fn tick_count(&self, entity: Entity) -> u32 {
-        self.ticks.get(entity).expect("entity without TickCount").0
-    }
-
-    pub fn log(&self, logs: &mut Logs, entity: Entity, msg: &str) {
-        logs.entity(
-            self.id(entity),
-            self.name(entity),
-            self.tick_count(entity),
-            msg,
+    /// `[ tick] name#id: msg`, printed immediately (entities tick one at a time, so lines come
+    /// out grouped per entity without any buffering).
+    pub fn log(&self, msg: impl fmt::Display) {
+        println!(
+            "[{:>4}] {}#{}: {msg}",
+            self.base.tick_count, self.kind.name, self.base.id.0
         );
     }
 }
 
-// ---- systems: the part of `EntityManager::tick_entities` + `Entity::tick` shared by all ----
+/// `entity.living()` / `entity.living_mut()` etc.: the part, or a panic naming the missing one.
+/// A pipeline stage that needs a part its entity lacks is a bug in the entity's definition.
+macro_rules! part_accessors {
+    ($($field:ident / $field_mut:ident: $ty:ty),* $(,)?) => {
+        impl Entity {
+            $(
+                #[track_caller]
+                pub fn $field(&self) -> &$ty {
+                    self.$field.as_ref().expect(concat!(
+                        "`", stringify!($field), "` stage on an entity without that part"
+                    ))
+                }
 
-/// Steel: `entity.advance_tick_count()`.
-pub fn advance_tick_count(world: &mut World) {
-    let removed = world.read::<Removed>();
-    let mut ticks = world.write::<TickCount>();
-    for (entity, tick) in ticks.iter_mut() {
-        if !removed.contains(entity) {
-            tick.0 += 1;
+                #[track_caller]
+                pub fn $field_mut(&mut self) -> &mut $ty {
+                    self.$field.as_mut().expect(concat!(
+                        "`", stringify!($field), "` stage on an entity without that part"
+                    ))
+                }
+            )*
         }
-    }
+    };
 }
 
-/// Steel: `Entity::base_tick`, `position += velocity`. Runs for every entity kind because
-/// living, item and falling-block ticks all start with `default_tick`.
-pub fn base_tick(world: &mut World) {
-    let removed = world.read::<Removed>();
-    let velocities = world.read::<Velocity>();
-    let mut positions = world.write::<Position>();
-    for (entity, position) in positions.iter_mut() {
-        if removed.contains(entity) {
-            continue;
-        }
-        if let Some(velocity) = velocities.get(entity) {
-            position.0 = position.0 + velocity.0;
-        }
-    }
+part_accessors! {
+    living / living_mut: Living,
+    mob / mob_mut: Mob,
+    ageable / ageable_mut: Ageable,
+    animal / animal_mut: Animal,
+    item / item_mut: Item,
+    falling_block / falling_block_mut: FallingBlock,
 }
 
-/// Steel: `EntityManager::tick_entities` final `retain(|e| !e.is_removed())`.
-pub fn drop_removed(world: &mut World) {
-    let doomed: Vec<Entity> = world.read::<Removed>().entities().to_vec();
-    for entity in doomed {
-        world.despawn(entity);
-    }
+/// Steel: `Entity::base_tick`, `position += velocity`. First stage of every pipeline.
+pub fn apply_velocity(e: &mut Entity, _cx: &mut Cx) {
+    e.base.position = e.base.position + e.base.velocity;
 }

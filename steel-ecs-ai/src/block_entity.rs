@@ -1,26 +1,15 @@
-//! Steel: `block_entity/mod.rs`. Base (name, position, tick count) + a `tick` hook.
+//! Steel: `block_entity/mod.rs`. Same shape as entities, smaller: a base (position, tick count),
+//! optional parts (`Campfire`, `Furnace`), and a kind whose pipeline replaces `BlockEntity::tick`.
 //! Concrete block entities only do counter math and log milestones.
-//!
-//! Block entities are ECS entities with their own base components (`BlockName`, `BlockPos`,
-//! `BlockTickCount`) instead of reusing `Name`/`Position`/`TickCount`: the entity systems
-//! iterate those storages and must not tick block entities (different phase, no `Removed`).
-//! `Campfire` and `Furnace` are the per-kind components; their tick systems replace the
-//! `BlockEntity::tick` trait method.
 
-use std::cell::Ref;
+use std::fmt;
 
-use crate::ecs::{Entity, SparseSet, World};
-use crate::log::Logs;
+pub type BlockStage = fn(&mut BlockEntity);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockEntityId(pub u32);
-
-pub struct BlockName(pub &'static str);
-
-#[derive(Clone, Copy, Debug)]
-pub struct BlockPos(pub (i32, i32, i32));
-
-pub struct BlockTickCount(pub u32);
+pub struct BlockKind {
+    pub name: &'static str,
+    pub pipeline: &'static [BlockStage],
+}
 
 /// Cooks one item: progress += 1 each tick, done at `cook_time`, then restarts.
 pub struct Campfire {
@@ -36,139 +25,110 @@ pub struct Furnace {
     pub output: u32,
 }
 
-fn spawn_base(
-    world: &mut World,
-    id: BlockEntityId,
-    name: &'static str,
-    pos: (i32, i32, i32),
-) -> Entity {
-    let entity = world.spawn_empty();
-    world.insert(entity, id);
-    world.insert(entity, BlockName(name));
-    world.insert(entity, BlockPos(pos));
-    world.insert(entity, BlockTickCount(0));
-    entity
+pub struct BlockEntity {
+    pub pos: (i32, i32, i32),
+    pub tick_count: u32,
+    pub kind: &'static BlockKind,
+    pub campfire: Option<Campfire>,
+    pub furnace: Option<Furnace>,
 }
 
-pub fn spawn_campfire(
-    world: &mut World,
-    id: BlockEntityId,
-    pos: (i32, i32, i32),
-    cook_time: u32,
-) -> Entity {
-    let entity = spawn_base(world, id, "campfire", pos);
-    world.insert(
-        entity,
-        Campfire {
-            cook_time,
-            progress: 0,
-            cooked: 0,
-        },
-    );
-    entity
-}
-
-pub fn spawn_furnace(
-    world: &mut World,
-    id: BlockEntityId,
-    pos: (i32, i32, i32),
-    fuel: u32,
-) -> Entity {
-    let entity = spawn_base(world, id, "furnace", pos);
-    world.insert(
-        entity,
-        Furnace {
-            fuel,
-            progress: 0,
-            output: 0,
-        },
-    );
-    entity
-}
-
-/// Block-entity counterpart of `EntityHeader` (log prefix pieces).
-pub struct BlockEntityHeader<'w> {
-    ids: Ref<'w, SparseSet<BlockEntityId>>,
-    names: Ref<'w, SparseSet<BlockName>>,
-    positions: Ref<'w, SparseSet<BlockPos>>,
-    ticks: Ref<'w, SparseSet<BlockTickCount>>,
-}
-
-impl<'w> BlockEntityHeader<'w> {
-    pub fn new(world: &'w World) -> Self {
+impl BlockEntity {
+    pub fn new(kind: &'static BlockKind, pos: (i32, i32, i32)) -> Self {
         Self {
-            ids: world.read(),
-            names: world.read(),
-            positions: world.read(),
-            ticks: world.read(),
+            pos,
+            tick_count: 0,
+            kind,
+            campfire: None,
+            furnace: None,
         }
     }
 
-    pub fn log(&self, logs: &mut Logs, entity: Entity, msg: &str) {
-        logs.block_entity(
-            *self
-                .ids
-                .get(entity)
-                .expect("block entity without BlockEntityId"),
-            self.names
-                .get(entity)
-                .expect("block entity without BlockName")
-                .0,
-            self.positions
-                .get(entity)
-                .expect("block entity without BlockPos")
-                .0,
-            self.ticks
-                .get(entity)
-                .expect("block entity without BlockTickCount")
-                .0,
-            msg,
+    pub fn campfire_mut(&mut self) -> &mut Campfire {
+        self.campfire
+            .as_mut()
+            .expect("campfire stage on a block entity without a Campfire")
+    }
+
+    pub fn furnace_mut(&mut self) -> &mut Furnace {
+        self.furnace
+            .as_mut()
+            .expect("furnace stage on a block entity without a Furnace")
+    }
+
+    /// `[ tick] name@x,y,z: msg`
+    pub fn log(&self, msg: impl fmt::Display) {
+        let (x, y, z) = self.pos;
+        println!(
+            "[{:>4}] {}@{x},{y},{z}: {msg}",
+            self.tick_count, self.kind.name
         );
     }
 }
 
-// ---- systems: `BlockEntityManager::tick` ----
+pub static CAMPFIRE: BlockKind = BlockKind {
+    name: "campfire",
+    pipeline: &[tick_campfire],
+};
 
-/// Steel: `be.advance_tick_count()`.
-pub fn advance_block_tick_count(world: &mut World) {
-    for (_, tick) in world.write::<BlockTickCount>().iter_mut() {
-        tick.0 += 1;
+pub static FURNACE: BlockKind = BlockKind {
+    name: "furnace",
+    pipeline: &[tick_furnace],
+};
+
+pub fn campfire(pos: (i32, i32, i32), cook_time: u32) -> BlockEntity {
+    BlockEntity {
+        campfire: Some(Campfire {
+            cook_time,
+            progress: 0,
+            cooked: 0,
+        }),
+        ..BlockEntity::new(&CAMPFIRE, pos)
+    }
+}
+
+pub fn furnace(pos: (i32, i32, i32), fuel: u32) -> BlockEntity {
+    BlockEntity {
+        furnace: Some(Furnace {
+            fuel,
+            progress: 0,
+            output: 0,
+        }),
+        ..BlockEntity::new(&FURNACE, pos)
     }
 }
 
 /// Steel: `CampfireBlockEntity::tick`.
-pub fn tick_campfires(world: &mut World) {
-    let header = BlockEntityHeader::new(world);
-    let mut campfires = world.write::<Campfire>();
-    let mut logs = world.res_mut::<Logs>();
-    for (entity, fire) in campfires.iter_mut() {
-        fire.progress += 1;
-        if fire.progress >= fire.cook_time {
-            fire.progress = 0;
-            fire.cooked += 1;
-            header.log(&mut logs, entity, &format!("cooked #{}", fire.cooked));
-        }
+pub fn tick_campfire(be: &mut BlockEntity) {
+    let fire = be.campfire_mut();
+    fire.progress += 1;
+    if fire.progress >= fire.cook_time {
+        fire.progress = 0;
+        fire.cooked += 1;
+        let cooked = fire.cooked;
+        be.log(format_args!("cooked #{cooked}"));
     }
 }
 
 /// Steel: `FurnaceBlockEntity::tick`.
-pub fn tick_furnaces(world: &mut World) {
-    let header = BlockEntityHeader::new(world);
-    let mut furnaces = world.write::<Furnace>();
-    let mut logs = world.res_mut::<Logs>();
-    for (entity, furnace) in furnaces.iter_mut() {
-        if furnace.fuel == 0 {
-            continue;
-        }
-        furnace.fuel -= 1;
-        furnace.progress += 1;
-        if furnace.progress >= 10 {
-            furnace.progress = 0;
-            furnace.output += 1;
-            header.log(&mut logs, entity, &format!("output {}", furnace.output));
-        }
-        if furnace.fuel == 0 {
-            header.log(&mut logs, entity, "out of fuel");
-        }
+pub fn tick_furnace(be: &mut BlockEntity) {
+    let furnace = be.furnace_mut();
+    if furnace.fuel == 0 {
+        return;
+    }
+    furnace.fuel -= 1;
+    furnace.progress += 1;
+    let fuel = furnace.fuel;
+    let mut output = None;
+    if furnace.progress >= 10 {
+        furnace.progress = 0;
+        furnace.output += 1;
+        output = Some(furnace.output);
+    }
+    if let Some(output) = output {
+        be.log(format_args!("output {output}"));
+    }
+    if fuel == 0 {
+        be.log("out of fuel");
     }
 }

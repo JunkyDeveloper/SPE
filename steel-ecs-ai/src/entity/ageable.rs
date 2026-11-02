@@ -1,8 +1,6 @@
-//! Steel: `ageable.rs`. Data: age. Tick step: age up until adult.
+//! Steel: `ageable.rs`. Part: age. Stage: age up until adult.
 
-use crate::ecs::World;
-use crate::entity::EntityHeader;
-use crate::log::Logs;
+use super::{Cx, Entity};
 
 pub struct Ageable {
     pub age: u32,
@@ -20,17 +18,13 @@ impl Ageable {
     }
 }
 
-pub fn tick_ageable_mobs(world: &mut World) {
-    let header = EntityHeader::new(world);
-    let mut ageables = world.write::<Ageable>();
-    let mut logs = world.res_mut::<Logs>();
-    for (entity, ageable) in ageables.iter_mut() {
-        if !header.is_active(entity) || !ageable.is_baby() {
-            continue;
-        }
-        ageable.age += 1;
-        if !ageable.is_baby() {
-            header.log(&mut logs, entity, "grew up");
-        }
+pub fn age_up(e: &mut Entity, _cx: &mut Cx) {
+    let ageable = e.ageable_mut();
+    if !ageable.is_baby() {
+        return;
+    }
+    ageable.age += 1;
+    if !ageable.is_baby() {
+        e.log("grew up");
     }
 }

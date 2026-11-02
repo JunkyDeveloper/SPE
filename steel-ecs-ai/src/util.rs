@@ -1,7 +1,7 @@
 //! Std-only helpers. Steel: `glam::DVec3`.
 //!
-//! No `SyncMutex` here: components live in plain `SparseSet`s and systems get them through
-//! the ECS `World`, so per-field locking is gone (see `ecs::World` for what replaced it).
+//! No `SyncMutex` here: entities are owned by the world and ticked through `&mut`, so there is
+//! nothing to lock (see `entity::store` for what that costs).
 
 use std::ops::{Add, Mul};
 

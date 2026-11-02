@@ -1,37 +1,28 @@
-//! Steel: `living_entity.rs` / `living_base`. Data: health. Tick step: regenerate.
+//! Steel: `living_entity.rs` / `living_base`. Part: health. Stage: regenerate.
 
-use crate::ecs::World;
-use crate::entity::EntityHeader;
-use crate::log::Logs;
+use super::{Cx, Entity};
 
-pub struct Health {
-    pub current: i32,
-    pub max: i32,
+pub struct Living {
+    pub health: i32,
+    pub max_health: i32,
 }
 
-impl Health {
-    pub fn new(current: i32, max: i32) -> Self {
-        Self { current, max }
+impl Living {
+    pub fn new(health: i32, max_health: i32) -> Self {
+        Self { health, max_health }
     }
 }
 
 /// +1 health every 20 ticks until full.
-pub fn tick_regeneration(world: &mut World) {
-    let header = EntityHeader::new(world);
-    let mut health = world.write::<Health>();
-    let mut logs = world.res_mut::<Logs>();
-    for (entity, h) in health.iter_mut() {
-        if !header.is_active(entity)
-            || !header.tick_count(entity).is_multiple_of(20)
-            || h.current >= h.max
-        {
-            continue;
-        }
-        h.current += 1;
-        header.log(
-            &mut logs,
-            entity,
-            &format!("health {}/{}", h.current, h.max),
-        );
+pub fn regenerate(e: &mut Entity, _cx: &mut Cx) {
+    if !e.base.tick_count.is_multiple_of(20) {
+        return;
     }
+    let living = e.living_mut();
+    if living.health >= living.max_health {
+        return;
+    }
+    living.health += 1;
+    let (health, max) = (living.health, living.max_health);
+    e.log(format_args!("health {health}/{max}"));
 }

@@ -4,26 +4,27 @@
 //! Lower priority number = more important. Goals whose flags overlap cannot run together:
 //! a more important goal preempts (stops) a running conflicting one.
 //!
-//! Goals stay trait objects, owned by a `GoalSelector` *component*. Their per-instance state
-//! (`remaining`, `direction`) lives inside the boxed goal, outside the ECS storages: goals
-//! are the one part of the design that does not become plain data.
+//! Goals stay trait objects: each keeps private per-instance state (`remaining`, `direction`),
+//! which is not worth turning into data. They get the whole `&mut Entity` (instead of
+//! steel-current's `&dyn Mob` accessor surface) and the tick context, so a goal can read or
+//! change any part and, through `Cx`, other entities.
 
-use crate::entity::MobCtx;
+use super::{Animal, Cx, Entity};
 use crate::util::Vec3;
 
 pub const FLAG_MOVE: u8 = 1;
 pub const FLAG_LOOK: u8 = 2;
 pub const FLAG_JUMP: u8 = 4;
 
-pub trait Goal {
+pub trait Goal: Send + Sync {
     fn flags(&self) -> u8;
-    fn can_use(&mut self, mob: &MobCtx) -> bool;
-    fn can_continue_to_use(&mut self, mob: &MobCtx) -> bool {
-        self.can_use(mob)
+    fn can_use(&mut self, e: &Entity, cx: &Cx) -> bool;
+    fn can_continue_to_use(&mut self, e: &Entity, cx: &Cx) -> bool {
+        self.can_use(e, cx)
     }
-    fn start(&mut self, _mob: &mut MobCtx) {}
-    fn stop(&mut self, _mob: &mut MobCtx) {}
-    fn tick(&mut self, _mob: &mut MobCtx) {}
+    fn start(&mut self, _e: &mut Entity, _cx: &mut Cx) {}
+    fn stop(&mut self, _e: &mut Entity, _cx: &mut Cx) {}
+    fn tick(&mut self, _e: &mut Entity, _cx: &mut Cx) {}
 }
 
 struct WrappedGoal {
@@ -38,21 +39,21 @@ pub struct GoalSelector {
 }
 
 impl GoalSelector {
-    pub fn add_goal(&mut self, priority: i32, goal: Box<dyn Goal>) {
+    pub fn add_goal(&mut self, priority: i32, goal: impl Goal + 'static) {
         self.goals.push(WrappedGoal {
             priority,
-            goal,
+            goal: Box::new(goal),
             running: false,
         });
         self.goals.sort_by_key(|g| g.priority);
     }
 
     /// Steel: `GoalSelector.tick`.
-    pub fn tick(&mut self, mob: &mut MobCtx) {
+    pub fn tick(&mut self, e: &mut Entity, cx: &mut Cx) {
         // 1. stop goals that can't continue
         for g in &mut self.goals {
-            if g.running && !g.goal.can_continue_to_use(mob) {
-                g.goal.stop(mob);
+            if g.running && !g.goal.can_continue_to_use(e, cx) {
+                g.goal.stop(e, cx);
                 g.running = false;
             }
         }
@@ -67,22 +68,22 @@ impl GoalSelector {
                 .goals
                 .iter()
                 .any(|o| o.running && o.goal.flags() & flags != 0 && o.priority <= priority);
-            if blocked || !self.goals[i].goal.can_use(mob) {
+            if blocked || !self.goals[i].goal.can_use(e, cx) {
                 continue;
             }
             for j in 0..self.goals.len() {
                 if j != i && self.goals[j].running && self.goals[j].goal.flags() & flags != 0 {
-                    self.goals[j].goal.stop(mob);
+                    self.goals[j].goal.stop(e, cx);
                     self.goals[j].running = false;
                 }
             }
-            self.goals[i].goal.start(mob);
+            self.goals[i].goal.start(e, cx);
             self.goals[i].running = true;
         }
         // 3. tick running goals
         for g in &mut self.goals {
             if g.running {
-                g.goal.tick(mob);
+                g.goal.tick(e, cx);
             }
         }
     }
@@ -113,27 +114,27 @@ impl Goal for WanderGoal {
     fn flags(&self) -> u8 {
         FLAG_MOVE
     }
-    fn can_use(&mut self, mob: &MobCtx) -> bool {
-        mob.tick_count.is_multiple_of(30)
+    fn can_use(&mut self, e: &Entity, _cx: &Cx) -> bool {
+        e.base.tick_count.is_multiple_of(30)
     }
-    fn can_continue_to_use(&mut self, _mob: &MobCtx) -> bool {
+    fn can_continue_to_use(&mut self, _e: &Entity, _cx: &Cx) -> bool {
         self.remaining > 0
     }
-    fn start(&mut self, mob: &mut MobCtx) {
+    fn start(&mut self, e: &mut Entity, _cx: &mut Cx) {
         self.remaining = 10;
         self.direction = -self.direction;
-        mob.log(if self.direction > 0.0 {
+        e.log(if self.direction > 0.0 {
             "wanders east"
         } else {
             "wanders west"
         });
     }
-    fn tick(&mut self, mob: &mut MobCtx) {
+    fn tick(&mut self, e: &mut Entity, _cx: &mut Cx) {
         self.remaining -= 1;
-        mob.velocity.x = self.direction * mob.move_speed;
+        e.base.velocity.x = self.direction * e.mob().move_speed;
     }
-    fn stop(&mut self, mob: &mut MobCtx) {
-        mob.velocity.x = 0.0;
+    fn stop(&mut self, e: &mut Entity, _cx: &mut Cx) {
+        e.base.velocity.x = 0.0;
     }
 }
 
@@ -158,20 +159,20 @@ impl Goal for LookAroundGoal {
     fn flags(&self) -> u8 {
         FLAG_LOOK
     }
-    fn can_use(&mut self, mob: &MobCtx) -> bool {
-        mob.tick_count.is_multiple_of(15)
+    fn can_use(&mut self, e: &Entity, _cx: &Cx) -> bool {
+        e.base.tick_count.is_multiple_of(15)
     }
-    fn can_continue_to_use(&mut self, _mob: &MobCtx) -> bool {
+    fn can_continue_to_use(&mut self, _e: &Entity, _cx: &Cx) -> bool {
         self.remaining > 0
     }
-    fn start(&mut self, _mob: &mut MobCtx) {
+    fn start(&mut self, _e: &mut Entity, _cx: &mut Cx) {
         self.remaining = 5;
     }
-    fn tick(&mut self, mob: &mut MobCtx) {
+    fn tick(&mut self, e: &mut Entity, _cx: &mut Cx) {
         self.remaining -= 1;
-        let yaw = mob.add_yaw(9.0);
+        let yaw = e.mob_mut().add_yaw(9.0);
         if self.remaining == 0 {
-            mob.log(&format!("looked around, yaw {yaw}"));
+            e.log(format_args!("looked around, yaw {yaw}"));
         }
     }
 }
@@ -197,24 +198,24 @@ impl Goal for EatGrassGoal {
     fn flags(&self) -> u8 {
         FLAG_MOVE | FLAG_LOOK
     }
-    fn can_use(&mut self, mob: &MobCtx) -> bool {
-        mob.hunger.as_deref().is_some_and(|h| h.is_hungry())
+    fn can_use(&mut self, e: &Entity, _cx: &Cx) -> bool {
+        e.animal.as_ref().is_some_and(Animal::is_hungry)
     }
-    fn can_continue_to_use(&mut self, _mob: &MobCtx) -> bool {
+    fn can_continue_to_use(&mut self, _e: &Entity, _cx: &Cx) -> bool {
         self.remaining > 0
     }
-    fn start(&mut self, mob: &mut MobCtx) {
+    fn start(&mut self, e: &mut Entity, _cx: &mut Cx) {
         self.remaining = 5;
-        mob.log("starts eating grass");
+        e.log("starts eating grass");
     }
-    fn tick(&mut self, mob: &mut MobCtx) {
+    fn tick(&mut self, e: &mut Entity, _cx: &mut Cx) {
         self.remaining -= 1;
-        *mob.velocity = Vec3::ZERO;
+        e.base.velocity = Vec3::ZERO;
         if self.remaining == 0 {
-            if let Some(hunger) = mob.hunger.as_deref_mut() {
-                hunger.reset();
+            if let Some(animal) = e.animal.as_mut() {
+                animal.reset_hunger();
             }
-            mob.log("ate grass");
+            e.log("ate grass");
         }
     }
 }
@@ -240,20 +241,20 @@ impl Goal for HopGoal {
     fn flags(&self) -> u8 {
         FLAG_JUMP
     }
-    fn can_use(&mut self, mob: &MobCtx) -> bool {
-        mob.tick_count.is_multiple_of(40)
+    fn can_use(&mut self, e: &Entity, _cx: &Cx) -> bool {
+        e.base.tick_count.is_multiple_of(40)
     }
-    fn can_continue_to_use(&mut self, _mob: &MobCtx) -> bool {
+    fn can_continue_to_use(&mut self, _e: &Entity, _cx: &Cx) -> bool {
         self.remaining > 0
     }
-    fn start(&mut self, _mob: &mut MobCtx) {
+    fn start(&mut self, _e: &mut Entity, _cx: &mut Cx) {
         self.remaining = 4;
     }
-    fn tick(&mut self, mob: &mut MobCtx) {
-        mob.position.y += if self.remaining > 2 { 0.25 } else { -0.25 };
+    fn tick(&mut self, e: &mut Entity, _cx: &mut Cx) {
+        e.base.position.y += if self.remaining > 2 { 0.25 } else { -0.25 };
         self.remaining -= 1;
         if self.remaining == 0 {
-            mob.log("hopped");
+            e.log("hopped");
         }
     }
 }

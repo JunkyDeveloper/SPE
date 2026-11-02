@@ -1,121 +1,137 @@
 # steel-ecs-ai
 
-`steel-current` ported to a hand-written, std-only ECS. Same entities (cow, chicken, item,
+`steel-current` redesigned **without a trait hierarchy**: same entities (cow, chicken, item,
 falling block), same goals/selector, same block entities (campfire, furnace), same tick order,
-same log output. `steel-current` is untouched; `steel-ecs` is untouched (empty, yours).
+same log output. `steel-current` and `steel-ecs` are untouched.
+
+The crate name is left over from the first attempt here (a hand-written ECS, replaced by this).
+There is no ECS in the crate any more.
 
 ```
 cargo run -p steel-ecs-ai     # stdout identical to `cargo run -p steel-current`
 cargo test -p steel-ecs-ai
 ```
 
+## The idea
+
+Two things Java's inheritance bundles together are separated:
+
+- **What a mob is** = the parts it carries. `Entity` is one struct: `Base` (id, position,
+  velocity, tick count) plus `Option<Living>`, `Option<Mob>`, `Option<Ageable>`,
+  `Option<Animal>`, and object parts (`Item`, `FallingBlock`). Public fields, no accessors to
+  override.
+- **What a tick does** = its `Kind`'s pipeline: a `&[Stage]` of plain
+  `fn(&mut Entity, &mut Cx)`, run in order. The vanilla step order is written **once** in
+  `entity/pipeline.rs` instead of being re-chained by hand in every concrete type.
+
+```rust
+// entity/pipeline.rs
+pub const ANIMAL: &[Stage] = &[
+    apply_velocity,       // Entity::base_tick
+    living::regenerate,   // LivingEntity
+    mob::run_goals,       // Mob
+    ageable::age_up,      // AgeableMob
+    animal::get_hungrier, // Animal
+];
+```
+
+A mob is a value (`entity/entities/cow.rs`, 85 lines + 5 trait impls in steel-current):
+
+```rust
+pub static COW: AnimalSpec = AnimalSpec {
+    kind: Kind { name: "cow", pipeline: pipeline::ANIMAL },
+    health: 5, max_health: 10, move_speed: 0.10, adult_age: 50, hunger_limit: 40,
+    goals,
+};
+fn goals(s: &mut GoalSelector) {
+    s.add_goal(3, EatGrassGoal::new());
+    s.add_goal(5, WanderGoal::new());
+    s.add_goal(7, LookAroundGoal::new());
+}
+```
+
+`tests/composition.rs` adds a pig this way from *outside* the crate, and defines custom stages
+(a push between entities) without touching any crate code.
+
+## What did NOT change: the tick
+
+Ticking is still **entity by entity** (`GameWorld::tick_entities` = the old
+`EntityManager::tick_entities`): spawn order, one entity through *all* its stages before the next.
+So:
+
+- vanilla order is kept, including an entity changing a later entity that then ticks with the
+  change in the *same* tick (`push_entity` in Steel). A design that runs each step over all
+  entities cannot do that. Test: `an_entitys_effect_on_a_later_entity_is_visible_in_the_same_tick`.
+- "spawned mid-tick first ticks next tick" is kept: the loop runs over the entities that existed
+  at tick start; `Cx::spawn` appends behind that bound. Test: `spawned_mid_tick_first_ticks_next_tick`.
+- removed entities are skipped and dropped after the pass.
+- log lines are printed inline. The previous raw-ECS version needed a sorted log buffer to fake
+  this order; here stdout is byte-identical with no such machinery (`tests/golden.rs`).
+
 ## Layout
 
-| steel-current                         | steel-ecs-ai                                                    |
-|---------------------------------------|-----------------------------------------------------------------|
-| `util.rs` (`Vec3`, `SyncMutex`)       | `util.rs` (`Vec3` only, no locks)                               |
-| `world.rs` (`World`, two managers)    | `world.rs` (`GameWorld`, component registry, schedule)          |
-| `entity/mod.rs` (`Entity` trait)      | `entity/mod.rs` (base components + shared systems)              |
-| `entity/{living,mob,ageable,animal}`  | same files: one component + one system each                     |
-| `entity/goal.rs`                      | `entity/goal.rs` (still trait objects, `&MobCtx` not `&dyn Mob`) |
-| `entity/entities/*`                   | same files: a spawn function (+ component/system for item, block) |
-| `block_entity.rs`                     | `block_entity.rs` (components + systems)                        |
-| `tests.rs`                            | `tests/behavior.rs` (same 9 scenarios + 2 extra), `tests/golden.rs` |
-| -                                     | `ecs/` the framework: entities, sparse sets, world, schedule    |
-| -                                     | `log.rs` deferred, sorted log buffer                            |
+| steel-current                              | steel-ecs-ai                                              |
+|--------------------------------------------|-----------------------------------------------------------|
+| `entity/mod.rs` `Entity` trait + `EntityBase` | `entity/mod.rs` `Entity` struct, `Base`, `Kind`, `Stage`  |
+| `living.rs` / `mob.rs` / `ageable.rs` / `animal.rs` (trait + `*Base`) | same files: one part + one stage each |
+| `ai_step` chained by hand per concrete type | `entity/pipeline.rs`, once                                |
+| `entities/{cow,chicken}.rs` (5 trait impls) | `AnimalSpec` values + `spawn_animal`                       |
+| `entities/{item,falling_block}.rs`         | part + stage + spawn fn each                              |
+| `entity/goal.rs` (`&dyn Mob`)              | `entity/goal.rs` (`&mut Entity` + `&mut Cx`)              |
+| `world.rs` two managers, `Arc` + `Mutex`   | `entity/store.rs` (`Store`, `Cx`) + `world.rs`            |
+| `block_entity.rs` (trait)                  | `block_entity.rs` (same pattern, smaller)                 |
+| `tests.rs`                                 | `tests/behavior.rs` (9 ported + 2), `tests/composition.rs`, `tests/golden.rs` |
 
-Tick = one schedule of plain `fn(&mut World)` systems, in the order `Entity::tick` used to chain
-by hand: tick count, move, regenerate, goals, age, hunger, item, falling block, drop removed,
-block entities, flush logs.
+## What it costs (and what is not solved)
 
-## What the ECS port costs
+- **Nothing can touch an entity from another thread.** steel-current is `Arc<dyn Entity>` with a
+  mutex per field, built so packet workers, the chunk sender and other world threads *can*
+  reach entities (nothing here does that while the tick runs, but the types allow it). Here the
+  world owns its entities and ticks through `&mut`: `GameWorld` is `Send + Sync` (test: moves to
+  another thread), but mutating it from several threads means a lock around the whole world or a
+  command queue. This is the main design decision, not a detail. Steel's players, trackers and
+  `Weak` references would have to be redesigned around it; none of that is modeled here.
+- **Handles instead of `Arc`.** `Handle` is generation-checked, so every access is an `Option`
+  (`world.health(cow)`, not `cow.health()`). Held handles go stale on despawn instead of keeping
+  the entity alive. There are still two ids: `Handle` (recycled slot) and `EntityId` (Steel-style
+  network id, monotonic, never reused).
+- **A ticking entity is invisible to itself through `Cx`.** To hold `&mut Entity` and `&mut Cx` at
+  once, the entity is moved out of its slot while it ticks (`Store::take`). `cx.get(own_handle)`
+  is `None`, `for_each_other` skips it (what pushing wants anyway). Same trick for the goal
+  selector inside `Mob` (`entity.mob().goals` is empty while goals run).
+- **"Entity has this part" is checked at runtime.** A stage on an entity without its part panics
+  with a message naming the part (`entity.living()` etc.). steel-current guaranteed it with
+  `Mob: LivingEntity: Entity`. A fix would be a check at spawn that the kind's pipeline is
+  satisfied by the parts; not done here.
+- **Every entity has a slot for every part.** `size_of::<Entity>() == 184` bytes, boxed. Rare
+  parts could be boxed; irrelevant at this size.
+- **Goals are still trait objects** with private state; they now get the whole `&mut Entity`
+  instead of a trait surface, which is the part that got easier to write.
+- **`Cx::for_each_other` is a linear scan.** It is where Steel's spatial index would plug in.
+- **Only the shared tick order is modeled.** There is no push, targeting or riding in the main
+  scenario (steel-current has none); `tests/composition.rs` has a minimal stand-in for the push.
+  Steel's real entity code (vehicle chains, relationships, callbacks) is not touched by this
+  prototype.
 
-Everything below was hit while porting, not guessed.
+## Measured
 
-**Framework you now own (~300 lines, not counting its tests).** Generational entity ids, one
-`SparseSet` per component type, type-erased storages so despawn can strip an entity from all of
-them, resources, a schedule. A library would supply this, but it is the part that has to be
-understood and debugged.
+Release, median of 3, stdout to /dev/null. Scratch benchmark outside the repo: N mixed entities
+(cow/chicken/item/falling block) + N/5 block entities, 200 ticks, one thread everywhere. All
+variants print the same output (checked by hash on a 2000-entity run; 178 500 lines at N = 10 000).
+`current, no lock` = a copy of `steel-current` with the mutex replaced by an unsynchronized cell
+(ablation only, unsound under threads). `raw ECS` = the previous version of this crate.
 
-**No typed queries.** Every system manually takes guards (`world.read::<T>()` /
-`world.write::<T>()`) and joins by hand: iterate one storage, `get(entity)` in the others,
-re-check `Removed` in every system. `EntityHeader` / `BlockEntityHeader` exist only to cut that
-boilerplate. `MobCtx` is the same idea for goals.
+| N entities | current | current, no lock | raw ECS | bevy_ecs | **this crate** |
+|-----------:|--------:|-----------------:|--------:|---------:|---------------:|
+|     10 000 |  302 ms |           112 ms |   94 ms |    91 ms |      **108 ms** |
+|    100 000 |  3.36 s |           1.49 s |  1.06 s |   1.00 s |      **1.38 s** |
 
-**Runtime borrow checking.** Storages sit in `RefCell`s so a system can hold several at once
-through `&World`. Two `write::<T>()` of the same type is a *runtime* panic (see the test).
-Nothing declares what a system reads/writes, so nothing can schedule systems in parallel, and
-`World` is `!Sync`. Execution is the same as steel-current today: both tick on one thread
-(`tick_game` is sequential loops; no thread is ever spawned, checked at runtime: 1 OS thread).
-The difference is headroom, not current behavior: steel-current is *built* thread-safe
-(`&self`, `Send + Sync`, mutex per field, atomics, `Arc`) so a caller could share it across
-threads or tick entities in parallel, and it pays for that on every access even though nothing
-uses it. This port gave that up; getting it back means `Sync` storages plus declared system
-access, which is exactly what the missing typed-query layer would provide.
-
-**Structural changes can't overlap iteration.** Spawn/despawn/insert take `&mut World`, so a
-system collects entities, drops its guards, then applies (see `tick_items`). Consequences:
-- Marking `Removed` and the final despawn are separate steps.
-- steel-current's "spawned mid-tick first ticks next tick" snapshot rule does not carry over.
-  Nothing can spawn mid-tick here (`spawn_*` needs `&mut GameWorld`). A system that wants to
-  spawn (item drops, breeding) needs a deferred command queue; this crate has none.
-
-**Invariants moved from types to `expect`.** `Mob: LivingEntity: Entity` guaranteed a mob has
-position/velocity/tick count. Now a mob "should" have them; `tick_goal_selectors` panics with
-`mob without Position` if not. Components must also be registered up front, else runtime panic.
-
-**Order is manual and visible in the log.** Per-entity step order is now the order of
-`add_system` calls. Cross-entity order changed: a system runs one step over *all* entities, and
-dense storage order is not spawn order after any removal. Inline printing would regroup lines by
-step. To keep stdout byte-identical, systems push to a `Logs` resource and the last system
-stable-sorts by (entity id, then block entity id) before printing. That buffer exists purely to
-reproduce the old observable behavior.
-
-**Goals do not become data.** `Goal` trait objects keep private state (`remaining`, `direction`)
-inside the boxed goal, outside the storages. A goal that needs a new component means extending
-`MobCtx` and `tick_goal_selectors`. `Goal` is `&MobCtx`, not `&dyn Mob`: the old `as_animal()`
-became `Option<&mut Hunger>`.
-
-**Two ids per entity.** `Entity` is a recycled `(index, generation)` handle; the Steel-style id
-in log lines must be monotonic and never reused, so it is its own `EntityId` component. Held
-handles go stale on despawn, so every accessor is `Option` (`world.health(cow)` instead of
-`cow.health()`); `Arc<T>` handles with typed methods are gone.
-
-**Memory/shape details.** Each `SparseSet` keeps a sparse array sized to the highest entity
-index ever stored for that component (20 storages here). Removal is `swap_remove`, so iteration
-order is unstable. Despawn is O(number of component types).
-
-**New entity kind = more touch points.** Components + `register_components` + system +
-`build_schedule` entry + (if tests want it) a `GameWorld` accessor. Cow vs chicken is now just
-`AnimalSpec` data, which is the part that got *cheaper*.
-
-## Measured (release, 3 runs each, median, stdout to /dev/null)
-
-Scratch benchmark outside the repo (not committed): N mixed entities (cow/chicken/item/falling
-block) + N/5 block entities, 200 ticks, one thread everywhere. Both emit the same number of log
-lines (178 500 at N = 10 000). `current` = a copy of `steel-current`, only `main` replaced.
-`current, no locks` = that copy with `SyncMutex` swapped for an unsynchronized cell. It is an
-ablation to attribute the gap, unsound under threads, never meant to ship.
-
-| N entities | current | current, no locks | steel-ecs-ai |
-|-----------:|--------:|------------------:|-------------:|
-|     10 000 |  290 ms |            111 ms |        89 ms |
-|    100 000 |  3.19 s |            1.40 s |       1.00 s |
-
-So the ECS port is faster even though both tick on one thread. Where it comes from:
-- **Mutex: ~85% of the gap.** Taking the lock out of steel-current alone goes 290 -> 111 ms
-  (3.19 -> 1.40 s). It pays an uncontended `std::sync::Mutex` lock/unlock on every field access
-  for thread-safety nothing uses today. Real Steel's `SyncMutex` may be cheaper than std's
-  (not measured here), which would shrink this part.
-- **Remainder: 22 ms at 10k, 0.4 s at 100k (current-no-locks is still 25-40% slower than the
-  ECS).** Not separately measured. Candidates:
-  `Arc<dyn Entity>` pointer chasing and dyn dispatch, the per-tick snapshot `clone()` of the
-  entity list (an atomic refcount inc/dec per entity), versus packed arrays. `perf` is blocked
-  on this machine, so this part is attribution by elimination, not profiling.
-
-Caveats: synthetic workload, uncontended locks, one machine. Speed is not what the port costs;
-the costs that matter are the ones above: ergonomics, runtime-checked borrows, lost
-multi-thread headroom, deferred structural changes.
-
-Code size, comments/blank/test lines excluded: steel-current ~880 lines; this port ~1030 lines
-of game code (rustfmt expanded some lines, so slightly inflated) plus ~300 lines of ECS.
+Reading it:
+- Against steel-current: 2.8x (10k) and 2.4x (100k) faster. Most of that is the lock and the
+  `Arc` traffic, which entities no longer pay (steel-current is 302 -> 112 ms by removing the lock
+  alone).
+- Against the column-based ECS: 15-30% slower. The columnar versions read packed arrays; this
+  one reads a 184-byte boxed struct per entity. That is my explanation, not a measurement:
+  `perf` is blocked on this machine.
+- This is a toy workload (no collisions, no world queries, no pathfinding). Real entity ticking in
+  Steel spends its time in exactly those, which none of these numbers say anything about.

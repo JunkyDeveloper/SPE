@@ -1,77 +1,67 @@
-//! Steel: `animal.rs`. Data: hunger. Tick step: get hungrier up to the limit, log once when hungry.
+//! Steel: `animal.rs`. Part: hunger. Stage: get hungrier up to the limit, log once when hungry.
 //! Something else (a goal) has to reset it.
+//!
+//! [`AnimalSpec`] is what `CowEntity` / `ChickenEntity` used to be: five trait impls of mostly
+//! forwarding code, now one value.
 
-use crate::ecs::{Entity, World};
-use crate::entity::{
-    Ageable, EntityHeader, EntityId, Goal, GoalSelector, Health, MoveSpeed, Yaw, spawn_base,
-};
-use crate::log::Logs;
+use super::{Ageable, Cx, Entity, GoalSelector, Kind, Living, Mob};
 use crate::util::Vec3;
 
-pub struct Hunger {
-    pub value: u32,
-    pub limit: u32,
+pub struct Animal {
+    pub hunger: u32,
+    pub hunger_limit: u32,
 }
 
-impl Hunger {
-    pub fn new(limit: u32) -> Self {
-        Self { value: 0, limit }
+impl Animal {
+    pub fn new(hunger_limit: u32) -> Self {
+        Self {
+            hunger: 0,
+            hunger_limit,
+        }
     }
 
     pub fn is_hungry(&self) -> bool {
-        self.value >= self.limit
+        self.hunger >= self.hunger_limit
     }
 
-    pub fn reset(&mut self) {
-        self.value = 0;
-    }
-}
-
-pub fn tick_animals(world: &mut World) {
-    let header = EntityHeader::new(world);
-    let mut hungers = world.write::<Hunger>();
-    let mut logs = world.res_mut::<Logs>();
-    for (entity, hunger) in hungers.iter_mut() {
-        if !header.is_active(entity) || hunger.value >= hunger.limit {
-            continue;
-        }
-        hunger.value += 1;
-        if hunger.value == hunger.limit {
-            header.log(&mut logs, entity, "is hungry");
-        }
+    pub fn reset_hunger(&mut self) {
+        self.hunger = 0;
     }
 }
 
-/// The per-type constants that were trait methods (`move_speed`, `adult_age`, `hunger_limit`)
-/// and constructor arguments in steel-current. Cow and chicken only differ in this data.
+pub fn get_hungrier(e: &mut Entity, _cx: &mut Cx) {
+    let animal = e.animal_mut();
+    if animal.hunger >= animal.hunger_limit {
+        return;
+    }
+    animal.hunger += 1;
+    if animal.hunger == animal.hunger_limit {
+        e.log("is hungry");
+    }
+}
+
+/// Everything that differs between animals. The behavior (which stages run, in which order) is
+/// the `kind`'s pipeline, shared.
 pub struct AnimalSpec {
-    pub name: &'static str,
+    pub kind: Kind,
     pub health: i32,
     pub max_health: i32,
     pub move_speed: f64,
     pub adult_age: u32,
     pub hunger_limit: u32,
-    pub goals: Vec<(i32, Box<dyn Goal>)>,
+    /// Registers this animal's goals (shared ones and its own).
+    pub goals: fn(&mut GoalSelector),
 }
 
-/// Inserts the full Entity -> Living -> Mob -> Ageable -> Animal component chain.
-pub fn spawn_animal(
-    world: &mut World,
-    id: EntityId,
-    position: Vec3,
-    age: u32,
-    spec: AnimalSpec,
-) -> Entity {
-    let entity = spawn_base(world, id, spec.name, position);
-    let mut selector = GoalSelector::default();
-    for (priority, goal) in spec.goals {
-        selector.add_goal(priority, goal);
+/// `age` below `spec.adult_age` means baby.
+pub fn spawn_animal(spec: &'static AnimalSpec, position: Vec3, age: u32) -> Entity {
+    let mut mob = Mob::new(spec.move_speed);
+    (spec.goals)(&mut mob.goals);
+    Entity {
+        living: Some(Living::new(spec.health, spec.max_health)),
+        mob: Some(mob),
+        ageable: Some(Ageable::new(age, spec.adult_age)),
+        animal: Some(Animal::new(spec.hunger_limit)),
+        ..Entity::new(&spec.kind, position)
     }
-    world.insert(entity, Health::new(spec.health, spec.max_health));
-    world.insert(entity, MoveSpeed(spec.move_speed));
-    world.insert(entity, Yaw(0.0));
-    world.insert(entity, selector);
-    world.insert(entity, Ageable::new(age, spec.adult_age));
-    world.insert(entity, Hunger::new(spec.hunger_limit));
-    entity
 }

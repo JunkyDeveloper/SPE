@@ -7,6 +7,11 @@ Third design next to `steel-current` (traits + mutexes) and `steel-ecs-ai` (hand
 the file layout mirrors `steel-ecs-ai` so the three can be diffed side by side.
 `steel-current`, `steel-ecs-ai` and `steel-ecs` are untouched.
 
+> **Note:** `steel-ecs-ai` was rewritten after this README was written. It is no longer a raw
+> ECS but a composition design (one `Entity` struct of optional parts + ordered stage lists,
+> entity-by-entity ticking). Every mention of `steel-ecs-ai` below, and the file-layout mirroring,
+> refers to its earlier hand-rolled-ECS version. See `steel-ecs-ai/README.md` for the current one.
+
 ```
 cargo run -p steel-ecs-bevy     # stdout identical to `cargo run -p steel-current`
 cargo test -p steel-ecs-bevy
