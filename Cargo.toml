@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["steel-ecs", "steel-current"]
+members = ["steel-ecs", "steel-current", "steel-ecs-ai", "steel-ecs-bevy"]

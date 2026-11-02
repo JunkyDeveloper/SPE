@@ -1,0 +1,9 @@
+[package]
+name = "steel-ecs-bevy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Standalone ECS crate only (not the `bevy` umbrella). `default-features = false` drops
+# bevy_reflect, the async executor and backtrace support; `multi_threaded` is NOT enabled.
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std"] }
