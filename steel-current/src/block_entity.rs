@@ -1,57 +1,130 @@
-//! Steel: `block_entity/mod.rs`. Base (name, position, tick count) + a `tick` hook.
+//! Steel: `block_entity/mod.rs`. Base (type, position, removed flag) + a `tick(&self, world)` hook;
+//! removal goes through the blanket `BlockEntityLifecycleExt`.
 //! Concrete block entities only do counter math and log milestones.
 
-use crate::util::SyncMutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub type SharedBlockEntity = std::sync::Arc<dyn BlockEntity>;
+use crate::util::{BlockPos, SyncMutex};
+use crate::world::World;
+
+pub type SharedBlockEntity = Arc<dyn BlockEntity>;
 
 pub struct BlockEntityBase {
-    name: &'static str,
-    pos: (i32, i32, i32),
-    tick_count: SyncMutex<u32>,
+    block_entity_type: &'static str,
+    pos: BlockPos,
+    removed: AtomicBool,
 }
 
 impl BlockEntityBase {
-    pub fn new(name: &'static str, pos: (i32, i32, i32)) -> Self {
-        Self { name, pos, tick_count: SyncMutex::new(0) }
+    pub fn new(block_entity_type: &'static str, pos: BlockPos) -> Self {
+        Self { block_entity_type, pos, removed: AtomicBool::new(false) }
     }
 }
 
 pub trait BlockEntity: Send + Sync + 'static {
     fn base(&self) -> &BlockEntityBase;
 
-    fn advance_tick_count(&self) {
-        *self.base().tick_count.lock() += 1;
+    fn get_type(&self) -> &'static str {
+        self.base().block_entity_type
     }
-    fn tick_count(&self) -> u32 {
-        *self.base().tick_count.lock()
+    fn get_block_pos(&self) -> BlockPos {
+        self.base().pos
     }
-    fn log(&self, msg: &str) {
-        let (x, y, z) = self.base().pos;
-        println!("[{:>4}] {}@{x},{y},{z}: {msg}", self.tick_count(), self.base().name);
+    fn log(&self, world: &World, msg: &str) {
+        let (x, y, z) = self.get_block_pos();
+        println!("[{:>4}] {}@{x},{y},{z}: {msg}", world.game_time(), self.get_type());
     }
-    fn tick(&self);
+
+    /// Called every game tick for ticking block entities.
+    fn tick(&self, _world: &Arc<World>) {}
+}
+
+/// Final lifecycle operations; concrete block entities can't override these.
+pub trait BlockEntityLifecycleExt: BlockEntity {
+    fn is_removed(&self) -> bool {
+        self.base().removed.load(Ordering::Relaxed)
+    }
+    fn set_removed(&self) {
+        self.base().removed.store(true, Ordering::Relaxed);
+    }
+}
+
+impl<T: BlockEntity + ?Sized> BlockEntityLifecycleExt for T {}
+
+const BURN_DURATION: i32 = 20; // vanilla coal: 1600
+const COOK_TIME: i32 = 10; // vanilla 200
+
+#[derive(Default)]
+pub struct FurnaceState {
+    pub input: u32,
+    pub fuel: u32,
+    pub result: u32,
+    pub lit_time: i32,
+    pub cooking_progress: i32,
+}
+
+/// Vanilla `AbstractFurnaceBlockEntity.serverTick`, slots reduced to counters.
+pub struct FurnaceBlockEntity {
+    base: BlockEntityBase,
+    state: SyncMutex<FurnaceState>,
+}
+
+impl FurnaceBlockEntity {
+    pub fn new(pos: BlockPos, input: u32, fuel: u32) -> Self {
+        Self { base: BlockEntityBase::new("furnace", pos), state: SyncMutex::new(FurnaceState { input, fuel, ..Default::default() }) }
+    }
+    pub fn state(&self) -> std::sync::MutexGuard<'_, FurnaceState> {
+        self.state.lock()
+    }
+}
+
+impl BlockEntity for FurnaceBlockEntity {
+    fn base(&self) -> &BlockEntityBase {
+        &self.base
+    }
+
+    fn tick(&self, world: &Arc<World>) {
+        let burned = {
+            let mut s = self.state.lock();
+            if s.lit_time > 0 {
+                s.lit_time -= 1;
+            }
+            let can_burn = s.input > 0;
+            if s.lit_time <= 0 && can_burn && s.fuel > 0 {
+                s.fuel -= 1;
+                s.lit_time = BURN_DURATION;
+            }
+            if s.lit_time > 0 && can_burn {
+                s.cooking_progress += 1;
+            } else {
+                s.cooking_progress = 0;
+            }
+            let burned = s.cooking_progress == COOK_TIME;
+            if burned {
+                s.cooking_progress = 0;
+                s.input -= 1;
+                s.result += 1;
+            }
+            burned
+        };
+        if burned {
+            self.log(world, &format!("smelted, result x{}", self.state.lock().result));
+        }
+    }
 }
 
 /// Cooks one item: progress += 1 each tick, done at `cook_time`, then restarts.
 pub struct CampfireBlockEntity {
     base: BlockEntityBase,
-    cook_time: u32,
-    progress: SyncMutex<u32>,
+    cook_time: i32,
+    progress: SyncMutex<i32>,
     cooked: SyncMutex<u32>,
 }
 
 impl CampfireBlockEntity {
-    pub fn new(pos: (i32, i32, i32), cook_time: u32) -> Self {
-        Self {
-            base: BlockEntityBase::new("campfire", pos),
-            cook_time,
-            progress: SyncMutex::new(0),
-            cooked: SyncMutex::new(0),
-        }
-    }
-    pub fn progress(&self) -> u32 {
-        *self.progress.lock()
+    pub fn new(pos: BlockPos, cook_time: i32) -> Self {
+        Self { base: BlockEntityBase::new("campfire", pos), cook_time, progress: SyncMutex::new(0), cooked: SyncMutex::new(0) }
     }
     pub fn cooked(&self) -> u32 {
         *self.cooked.lock()
@@ -62,78 +135,18 @@ impl BlockEntity for CampfireBlockEntity {
     fn base(&self) -> &BlockEntityBase {
         &self.base
     }
-    fn tick(&self) {
+    fn tick(&self, world: &Arc<World>) {
         let done = {
             let mut p = self.progress.lock();
             *p += 1;
-            if *p >= self.cook_time {
+            *p >= self.cook_time && {
                 *p = 0;
                 true
-            } else {
-                false
             }
         };
         if done {
             *self.cooked.lock() += 1;
-            self.log(&format!("cooked #{}", self.cooked()));
-        }
-    }
-}
-
-/// Burns 1 fuel/tick; every 10 burning ticks produces 1 output.
-pub struct FurnaceBlockEntity {
-    base: BlockEntityBase,
-    fuel: SyncMutex<u32>,
-    progress: SyncMutex<u32>,
-    output: SyncMutex<u32>,
-}
-
-impl FurnaceBlockEntity {
-    pub fn new(pos: (i32, i32, i32), fuel: u32) -> Self {
-        Self {
-            base: BlockEntityBase::new("furnace", pos),
-            fuel: SyncMutex::new(fuel),
-            progress: SyncMutex::new(0),
-            output: SyncMutex::new(0),
-        }
-    }
-    pub fn fuel(&self) -> u32 {
-        *self.fuel.lock()
-    }
-    pub fn output(&self) -> u32 {
-        *self.output.lock()
-    }
-}
-
-impl BlockEntity for FurnaceBlockEntity {
-    fn base(&self) -> &BlockEntityBase {
-        &self.base
-    }
-    fn tick(&self) {
-        let fuel = {
-            let mut f = self.fuel.lock();
-            if *f == 0 {
-                return;
-            }
-            *f -= 1;
-            *f
-        };
-        let produced = {
-            let mut p = self.progress.lock();
-            *p += 1;
-            if *p >= 10 {
-                *p = 0;
-                true
-            } else {
-                false
-            }
-        };
-        if produced {
-            *self.output.lock() += 1;
-            self.log(&format!("output {}", self.output()));
-        }
-        if fuel == 0 {
-            self.log("out of fuel");
+            self.log(world, &format!("cooked #{}", self.cooked()));
         }
     }
 }
